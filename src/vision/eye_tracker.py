@@ -5,18 +5,18 @@ import time
 import collections
 
 from src.config import *
-from eyetrax.calibration import (
-    run_9_point_calibration,
-)
-from eyetrax.filters import (
-    KalmanSmoother,
-    make_kalman,
-)
+from eyetrax.calibration import run_9_point_calibration
+from eyetrax.filters import make_kalman, KalmanEMASmoother
 from eyetrax.gaze import GazeEstimator
 from src.vision.gaze_state import GazeState
 
 # Created once at module level — expensive to initialise per frame
 _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+
+# Fixation threshold: gaze stable within 25px = fixating
+FIXATION_THRESHOLD_PX = 25
+# Outlier rejection: skip jumps larger than this
+MAX_JUMP_PX = 280
 
 
 def _preprocess(frame):
@@ -24,7 +24,7 @@ def _preprocess(frame):
     Bilateral filter + CLAHE on luminance channel.
     Improves iris detection for glasses wearers and small/squinted eyes.
     - Bilateral filter removes noise without blurring the iris edge
-    - CLAHE only on L channel (brightness) — correct, not on colour
+    - CLAHE only on L (brightness) channel — does not distort colour
     Inspired by GazeTracking (github.com/antoinelame/GazeTracking)
     """
     frame = cv2.bilateralFilter(frame, d=7, sigmaColor=50, sigmaSpace=50)
@@ -32,6 +32,33 @@ def _preprocess(frame):
     l, a, b = cv2.split(lab)
     lab = cv2.merge([_CLAHE.apply(l), a, b])
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _detect_iris_center(frame, face_landmarks, eye_indices):
+    """
+    Refine gaze using actual iris center detection on the eye region.
+    Finds the darkest point (pupil center) in the isolated eye region.
+    Returns (cx, cy) in frame coordinates, or None if detection fails.
+    """
+    h, w = frame.shape[:2]
+
+    xs = [int(face_landmarks[i].x * w) for i in eye_indices]
+    ys = [int(face_landmarks[i].y * h) for i in eye_indices]
+
+    x1, x2 = max(min(xs) - 10, 0), min(max(xs) + 10, w)
+    y1, y2 = max(min(ys) - 10, 0), min(max(ys) + 10, h)
+
+    eye_roi = frame[y1:y2, x1:x2]
+    if eye_roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(eye_roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    _, _, _, max_loc = cv2.minMaxLoc(cv2.bitwise_not(gray))
+    cx = x1 + max_loc[0]
+    cy = y1 + max_loc[1]
+    return cx, cy
 
 
 class EyeTracker:
@@ -43,6 +70,17 @@ class EyeTracker:
         self._blink_log = collections.deque()
         self._prev_blink = False
 
+        # outlier rejection: track last accepted position
+        self._last_x = None
+        self._last_y = None
+
+        # fixation: track smoothed position history
+        self._smooth_x = None
+        self._smooth_y = None
+
+        # small window for stable fixation
+        self._fix_window = collections.deque(maxlen=3)
+
         self._set_smoother()
 
     # -----------------------------
@@ -51,14 +89,13 @@ class EyeTracker:
 
     def create_model(self, path):
         try:
-            # 9-point gives better spatial coverage than 5-point
             run_9_point_calibration(self.gaze_estimator)
             self.gaze_estimator.save_model(path)
             self.gaze_estimator.load_model(path)
             print(f"[EyeTracker] Model created: {path}")
         except Exception as e:
             print(f"[EyeTracker] \033[91mError:\033[0m create_model failed: {e}")
-            raise  # surface the failure — caller must know it failed
+            raise
 
     def load_model(self, path):
         try:
@@ -73,19 +110,23 @@ class EyeTracker:
     # -----------------------------
 
     def _set_smoother(self):
-        self.kalman = make_kalman()
-        self.smoother = KalmanSmoother(self.kalman)
+        # KalmanEMA: smoother than plain Kalman, less lag than heavy averaging
+        self.smoother = KalmanEMASmoother(kf=make_kalman(), ema_alpha=0.25)
 
     # -----------------------------
     # RESET
     # -----------------------------
 
     def reset(self):
-        """Clear per-trial state without losing the loaded model.
-        Call this between sessions or game rounds."""
+        """Clear per-trial state without losing the loaded model."""
         self.current_state = GazeState()
         self._blink_log.clear()
         self._prev_blink = False
+        self._last_x = None
+        self._last_y = None
+        self._smooth_x = None
+        self._smooth_y = None
+        self._fix_window.clear()
         self._set_smoother()
 
     # -----------------------------
@@ -96,9 +137,7 @@ class EyeTracker:
         if frame is None:
             return self.current_state
 
-        # preprocess before feature extraction (glasses/small eyes support)
         processed = _preprocess(frame)
-
         s = self.current_state
 
         try:
@@ -108,13 +147,12 @@ class EyeTracker:
 
         s.blink_detected = blink_detected
 
-        # track blink onsets (rising edge only) for BPM
-        # rising edge = only the moment blinking starts, not every blink frame
+        # blink onset — rising edge only
         if blink_detected and not self._prev_blink:
             self._blink_log.append(time.time())
         self._prev_blink = blink_detected
 
-        # drop blinks older than 60 seconds from the rolling window
+        # drop blinks older than 60 s
         now = time.time()
         while self._blink_log and self._blink_log[0] < now - 60:
             self._blink_log.popleft()
@@ -122,28 +160,50 @@ class EyeTracker:
         if features is not None and not blink_detected:
             try:
                 gaze_point = self.gaze_estimator.predict(np.array([features]))[0]
-                x, y = map(int, gaze_point)
+                x, y = float(gaze_point[0]), float(gaze_point[1])
+                print("GAZE:", x, y)
 
-                # store previous position before updating
-                prev_x = s.pred_x if s.pred_x is not None else x
-                prev_y = s.pred_y if s.pred_y is not None else y
+                if np.isnan(x) or np.isnan(y):
+                    return s
 
-                s.pred_x, s.pred_y = self.smoother.step(x, y)
+                # iris refinement 
+                if hasattr(self.gaze_estimator, "face_landmarks"):
+                    iris = _detect_iris_center(frame, self.gaze_estimator.face_landmarks, [33, 133])
+                    if iris is not None:
+                        ix, iy = iris
+                        x = (x + ix) / 2
+                        y = (y + iy) / 2
+
+                # outlier rejection
+                if self._last_x is not None:
+                    dist = ((x - self._last_x)**2 + (y - self._last_y)**2) ** 0.5
+                    if dist > MAX_JUMP_PX:
+                        s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP * 0.5, 0.0)
+                        return s
+
+                self._last_x, self._last_y = x, y
+
+                sx, sy = self.smoother.step(x, y)
+                s.pred_x, s.pred_y = sx, sy
                 s.cursor_alpha = min(s.cursor_alpha + CURSOR_STEP, 1.0)
 
-                # fixation: gaze hasn't moved much from last position
-                s.is_fixating = (
-                    abs(x - prev_x) < 30 and
-                    abs(y - prev_y) < 30
-                )
+                # stable fixation using 3-frame window
+                self._fix_window.append((sx, sy))
+                if len(self._fix_window) == 3:
+                    xs = [p[0] for p in self._fix_window]
+                    ys = [p[1] for p in self._fix_window]
+                    spread = (max(xs) - min(xs)) + (max(ys) - min(ys))
+                    s.is_fixating = spread < FIXATION_THRESHOLD_PX
+                else:
+                    s.is_fixating = False
+
+                self._smooth_x, self._smooth_y = sx, sy
 
             except Exception:
-                s.pred_x = s.pred_y = None
                 s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP, 0.0)
                 s.is_fixating = False
         else:
-            s.pred_x = s.pred_y = None
-            s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP, 0.0)
+            s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP * 0.5, 0.0)
             s.is_fixating = False
 
         return s
@@ -156,10 +216,8 @@ class EyeTracker:
         if frame is None:
             return
 
-        # flip for display only — update() already saw the preprocessed frame
         frame = cv2.flip(frame, 1)
 
-        # gaze cursor with alpha fade + fixation ring
         if (
             current_state.pred_x is not None
             and current_state.pred_y is not None
@@ -170,13 +228,11 @@ class EyeTracker:
             radius = 15
             alpha_int = int(current_state.cursor_alpha * 255)
 
-            # SRCALPHA surface so the alpha fade actually works
             surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
             pygame.draw.circle(
                 surf, (*COLORS[4][:3], alpha_int), (radius, radius), radius
             )
 
-            # outer ring: green = fixating, amber = moving
             if current_state.is_fixating:
                 ring_col = (60, 220, 120, alpha_int // 2)
             else:
@@ -185,7 +241,6 @@ class EyeTracker:
             pygame.draw.circle(surf, ring_col, (radius, radius), radius, 3)
             screen.blit(surf, (cx - radius, cy - radius))
 
-        # camera thumbnail
         try:
             thumb = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT))
             thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB).swapaxes(0, 1)
@@ -197,7 +252,6 @@ class EyeTracker:
         except Exception:
             pass
 
-        # HUD: blink state + rolling BPM
         bpm = len(self._blink_log)
         if current_state.blink_detected:
             blink_txt = f"Blinking   BPM: {bpm}"
@@ -207,3 +261,13 @@ class EyeTracker:
             blink_clr = (60, 210, 100)
 
         screen.blit(font.render(blink_txt, True, blink_clr), (50, 100))
+
+        try:
+            small = pygame.font.SysFont("Arial", 18)
+            if current_state.is_fixating:
+                fix_txt, fix_col = "Fixating", (60, 220, 120)
+            else:
+                fix_txt, fix_col = "Scanning", (220, 160, 40)
+            screen.blit(small.render(fix_txt, True, fix_col), (50, 140))
+        except Exception:
+            pass

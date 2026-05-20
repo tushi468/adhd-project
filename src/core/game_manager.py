@@ -71,7 +71,21 @@ class GameManager:
         if self.current_frame is not None:
             self.current_state = self.eye_tracker.update(self.current_frame)
             x, y = self.current_state.pred_x, self.current_state.pred_y
-            self.session_recorder.record(x, y)
+
+            # ---------------------------------------------------
+            # FIXED: safe smoothing so cursor never becomes None
+            # ---------------------------------------------------
+            alpha = 0.35
+
+            if x is not None and y is not None:
+                if not hasattr(self, "_sx") or self._sx is None or self._sy is None:
+                    self._sx, self._sy = x, y
+                else:
+                    self._sx = alpha * x + (1 - alpha) * self._sx
+                    self._sy = alpha * y + (1 - alpha) * self._sy
+
+                # record smoothed values
+                self.session_recorder.record(self._sx, self._sy)
 
     def render_gaze_cursor(self):
         if self.eye_tracker and self.current_state:
@@ -89,6 +103,10 @@ class GameManager:
             return
 
         path = self.session_recorder.save_session()
+
+        if path is None:
+            print("[GameManager] No session data → skip heatmap")
+            return
 
         bg = pygame.surfarray.array3d(self.screen)
         bg = np.transpose(bg, (1, 0, 2))
