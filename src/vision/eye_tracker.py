@@ -3,6 +3,7 @@ import pygame
 import numpy as np
 import time
 import collections
+import os   
 
 from src.config import *
 from eyetrax.calibration import run_9_point_calibration
@@ -13,8 +14,8 @@ from src.vision.gaze_state import GazeState
 # Created once at module level — expensive to initialise per frame
 _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
-# Fixation threshold: gaze stable within 25px = fixating
-FIXATION_THRESHOLD_PX = 25
+# Fixation threshold: gaze stable within 70px = fixating (relaxed for noisy gaze)
+FIXATION_THRESHOLD_PX = 70
 # Outlier rejection: skip jumps larger than this
 MAX_JUMP_PX = 280
 
@@ -89,6 +90,8 @@ class EyeTracker:
 
     def create_model(self, path):
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
             run_9_point_calibration(self.gaze_estimator)
             self.gaze_estimator.save_model(path)
             self.gaze_estimator.load_model(path)
@@ -111,7 +114,8 @@ class EyeTracker:
 
     def _set_smoother(self):
         # KalmanEMA: smoother than plain Kalman, less lag than heavy averaging
-        self.smoother = KalmanEMASmoother(kf=make_kalman(), ema_alpha=0.25)
+        # Lower ema_alpha → stronger smoothing, less jitter
+        self.smoother = KalmanEMASmoother(kf=make_kalman(), ema_alpha=0.12)
 
     # -----------------------------
     # RESET
@@ -171,8 +175,9 @@ class EyeTracker:
                     iris = _detect_iris_center(frame, self.gaze_estimator.face_landmarks, [33, 133])
                     if iris is not None:
                         ix, iy = iris
-                        x = (x + ix) / 2
-                        y = (y + iy) / 2
+                        # Heavier weight on iris center for stability
+                        x = 0.3 * x + 0.7 * ix
+                        y = 0.3 * y + 0.7 * iy
 
                 # outlier rejection
                 if self._last_x is not None:

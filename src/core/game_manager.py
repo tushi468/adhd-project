@@ -73,19 +73,10 @@ class GameManager:
             x, y = self.current_state.pred_x, self.current_state.pred_y
 
             # ---------------------------------------------------
-            # FIXED: safe smoothing so cursor never becomes None
+            # record EyeTracker's own smoothed gaze
             # ---------------------------------------------------
-            alpha = 0.35
-
             if x is not None and y is not None:
-                if not hasattr(self, "_sx") or self._sx is None or self._sy is None:
-                    self._sx, self._sy = x, y
-                else:
-                    self._sx = alpha * x + (1 - alpha) * self._sx
-                    self._sy = alpha * y + (1 - alpha) * self._sy
-
-                # record smoothed values
-                self.session_recorder.record(self._sx, self._sy)
+                self.session_recorder.record(x, y)
 
     def render_gaze_cursor(self):
         if self.eye_tracker and self.current_state:
@@ -239,7 +230,9 @@ class GameManager:
         self.wokwi_server.stop()
         self.engine.cleanup()
 
-        self.generate_heatmap()
+        # Only generate heatmap if a game session was actually played
+        if self.game_state == GameState.PLAYING:
+            self.generate_heatmap()
 
         pygame.quit()
         sys.exit()
