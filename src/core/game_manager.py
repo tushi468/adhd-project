@@ -62,6 +62,13 @@ class GameManager:
         self.current_frame = None
         self.current_state = None
 
+    # stop camera and reset flag so setup_camera() runs again next game
+    def _stop_camera(self):
+        if self.camera:
+            self.camera.stop()
+            self.camera = None
+        self.has_camera = False
+
     # update camera
     def update_camera(self):
         if not self.camera or not self.eye_tracker or not self.session_recorder:
@@ -71,12 +78,7 @@ class GameManager:
         if self.current_frame is not None:
             self.current_state = self.eye_tracker.update(self.current_frame)
             x, y = self.current_state.pred_x, self.current_state.pred_y
-
-            # ---------------------------------------------------
-            # record EyeTracker's own smoothed gaze
-            # ---------------------------------------------------
-            if x is not None and y is not None:
-                self.session_recorder.record(x, y)
+            self.session_recorder.record(x, y)
 
     def render_gaze_cursor(self):
         if self.eye_tracker and self.current_state:
@@ -95,13 +97,13 @@ class GameManager:
 
         path = self.session_recorder.save_session()
 
+        # save_session() returns None when there is no recorded data
         if path is None:
-            print("[GameManager] No session data → skip heatmap")
+            print("[GameManager] No gaze data recorded → skip heatmap")
             return
 
-        bg = pygame.surfarray.array3d(self.screen)
-        bg = np.transpose(bg, (1, 0, 2))
-        bg = np.uint8(bg)
+        # black background — safe after pygame.quit(), avoids login screen bleed
+        bg = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
 
         self.session_recorder.generate_heatmap(bg, path)
 
@@ -178,6 +180,9 @@ class GameManager:
         self.engine.reset_game()
 
     def back_to_login(self):
+        # stop camera + clear recorder so next game starts fresh
+        self._stop_camera()
+        self.session_recorder = None
         self.game_state = GameState.LOGIN
         self.ui.switch_state(GameState.LOGIN)
 
@@ -224,15 +229,12 @@ class GameManager:
             self.update(deltaTime)
             self.render()
 
-        if self.camera:
-            self.camera.stop()
+        # generate heatmap before pygame.quit() — surface is still valid here
+        self.generate_heatmap()
 
+        self._stop_camera()
         self.wokwi_server.stop()
         self.engine.cleanup()
-
-        # Only generate heatmap if a game session was actually played
-        if self.game_state == GameState.PLAYING:
-            self.generate_heatmap()
 
         pygame.quit()
         sys.exit()

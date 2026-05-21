@@ -3,7 +3,6 @@ import pygame
 import numpy as np
 import time
 import collections
-import os   
 
 from src.config import *
 from eyetrax.calibration import run_9_point_calibration
@@ -14,10 +13,14 @@ from src.vision.gaze_state import GazeState
 # Created once at module level — expensive to initialise per frame
 _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
-# Fixation threshold: gaze stable within 70px = fixating (relaxed for noisy gaze)
-FIXATION_THRESHOLD_PX = 70
-# Outlier rejection: skip jumps larger than this
-MAX_JUMP_PX = 280
+# Fixation: gaze stable within 25px = fixating
+FIXATION_THRESHOLD_PX = 25
+# Require this many consecutive stable frames before declaring fixation.
+# Prevents the flag flickering on single noisy frames. 5 frames ≈ 167 ms.
+FIXATION_MIN_FRAMES = 5
+# Outlier rejection: skip jumps larger than this per frame.
+# 280 was nearly full screen height — tightened to block blink artefacts.
+MAX_JUMP_PX = 150
 
 
 def _preprocess(frame):
@@ -37,29 +40,24 @@ def _preprocess(frame):
 
 def _detect_iris_center(frame, face_landmarks, eye_indices):
     """
-    Refine gaze using actual iris center detection on the eye region.
-    Finds the darkest point (pupil center) in the isolated eye region.
-    Returns (cx, cy) in frame coordinates, or None if detection fails.
+    Iris center detection on isolated eye region.
+    Finds darkest point (pupil center) for sub-landmark accuracy.
+    Reduces residual jitter that smoothing alone cannot fix.
+    Inspired by GazeTracking iris detection approach.
+    NOTE: Foundation for Week 1 — not yet integrated into prediction pipeline.
     """
     h, w = frame.shape[:2]
-
     xs = [int(face_landmarks[i].x * w) for i in eye_indices]
     ys = [int(face_landmarks[i].y * h) for i in eye_indices]
-
     x1, x2 = max(min(xs) - 10, 0), min(max(xs) + 10, w)
     y1, y2 = max(min(ys) - 10, 0), min(max(ys) + 10, h)
-
     eye_roi = frame[y1:y2, x1:x2]
     if eye_roi.size == 0:
         return None
-
     gray = cv2.cvtColor(eye_roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
-
     _, _, _, max_loc = cv2.minMaxLoc(cv2.bitwise_not(gray))
-    cx = x1 + max_loc[0]
-    cy = y1 + max_loc[1]
-    return cx, cy
+    return x1 + max_loc[0], y1 + max_loc[1]
 
 
 class EyeTracker:
@@ -67,20 +65,20 @@ class EyeTracker:
         self.gaze_estimator = GazeEstimator()
         self.current_state = GazeState()
 
-        # rolling blink log → BPM over last 60 s
+        # rolling blink log → BPM over last 60s
         self._blink_log = collections.deque()
         self._prev_blink = False
 
-        # outlier rejection: track last accepted position
+        # outlier rejection
         self._last_x = None
         self._last_y = None
 
-        # fixation: track smoothed position history
+        # fixation: previous smoothed position
         self._smooth_x = None
         self._smooth_y = None
 
-        # small window for stable fixation
-        self._fix_window = collections.deque(maxlen=3)
+        # consecutive stable frames — resets on any movement
+        self._fixation_counter = 0
 
         self._set_smoother()
 
@@ -90,8 +88,6 @@ class EyeTracker:
 
     def create_model(self, path):
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-
             run_9_point_calibration(self.gaze_estimator)
             self.gaze_estimator.save_model(path)
             self.gaze_estimator.load_model(path)
@@ -113,9 +109,10 @@ class EyeTracker:
     # -----------------------------
 
     def _set_smoother(self):
-        # KalmanEMA: smoother than plain Kalman, less lag than heavy averaging
-        # Lower ema_alpha → stronger smoothing, less jitter
-        self.smoother = KalmanEMASmoother(kf=make_kalman(), ema_alpha=0.12)
+        # KalmanEMA reduces jitter better than plain Kalman at 30fps.
+        # ema_alpha lowered to 0.20 — less reactive to frame noise,
+        # ~1 frame extra latency which is acceptable for gaze interaction.
+        self.smoother = KalmanEMASmoother(kf=make_kalman(), ema_alpha=0.20)
 
     # -----------------------------
     # RESET
@@ -130,7 +127,7 @@ class EyeTracker:
         self._last_y = None
         self._smooth_x = None
         self._smooth_y = None
-        self._fix_window.clear()
+        self._fixation_counter = 0
         self._set_smoother()
 
     # -----------------------------
@@ -151,12 +148,12 @@ class EyeTracker:
 
         s.blink_detected = blink_detected
 
-        # blink onset — rising edge only
+        # blink onset — rising edge only (1 count per blink, not per frame)
         if blink_detected and not self._prev_blink:
             self._blink_log.append(time.time())
         self._prev_blink = blink_detected
 
-        # drop blinks older than 60 s
+        # drop blinks older than 60s
         now = time.time()
         while self._blink_log and self._blink_log[0] < now - 60:
             self._blink_log.popleft()
@@ -164,22 +161,9 @@ class EyeTracker:
         if features is not None and not blink_detected:
             try:
                 gaze_point = self.gaze_estimator.predict(np.array([features]))[0]
-                x, y = float(gaze_point[0]), float(gaze_point[1])
-                print("GAZE:", x, y)
+                x, y = map(int, gaze_point)
 
-                if np.isnan(x) or np.isnan(y):
-                    return s
-
-                # iris refinement 
-                if hasattr(self.gaze_estimator, "face_landmarks"):
-                    iris = _detect_iris_center(frame, self.gaze_estimator.face_landmarks, [33, 133])
-                    if iris is not None:
-                        ix, iy = iris
-                        # Heavier weight on iris center for stability
-                        x = 0.3 * x + 0.7 * ix
-                        y = 0.3 * y + 0.7 * iy
-
-                # outlier rejection
+                # outlier rejection — skip physically impossible jumps
                 if self._last_x is not None:
                     dist = ((x - self._last_x)**2 + (y - self._last_y)**2) ** 0.5
                     if dist > MAX_JUMP_PX:
@@ -188,28 +172,44 @@ class EyeTracker:
 
                 self._last_x, self._last_y = x, y
 
+                # smooth with KalmanEMA
                 sx, sy = self.smoother.step(x, y)
                 s.pred_x, s.pred_y = sx, sy
                 s.cursor_alpha = min(s.cursor_alpha + CURSOR_STEP, 1.0)
 
-                # stable fixation using 3-frame window
-                self._fix_window.append((sx, sy))
-                if len(self._fix_window) == 3:
-                    xs = [p[0] for p in self._fix_window]
-                    ys = [p[1] for p in self._fix_window]
-                    spread = (max(xs) - min(xs)) + (max(ys) - min(ys))
-                    s.is_fixating = spread < FIXATION_THRESHOLD_PX
+                # fixation detection on SMOOTHED position
+                # compares current smooth to previous smooth — stable, not flickery.
+                # counter must reach FIXATION_MIN_FRAMES before is_fixating = True,
+                # any movement resets it immediately.
+                if self._smooth_x is not None:
+                    moved = (
+                        (sx - self._smooth_x) ** 2 +
+                        (sy - self._smooth_y) ** 2
+                    ) ** 0.5
+                    if moved < FIXATION_THRESHOLD_PX:
+                        self._fixation_counter = min(self._fixation_counter + 1, FIXATION_MIN_FRAMES)
+                    else:
+                        self._fixation_counter = 0
+                    s.is_fixating = self._fixation_counter >= FIXATION_MIN_FRAMES
                 else:
+                    self._fixation_counter = 0
                     s.is_fixating = False
 
                 self._smooth_x, self._smooth_y = sx, sy
 
             except Exception:
+                s.pred_x = s.pred_y = None
                 s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP, 0.0)
                 s.is_fixating = False
+                self._fixation_counter = 0
+
         else:
+            # hold position during blink — less jarring visually
+            if not blink_detected:
+                s.pred_x = s.pred_y = None
             s.cursor_alpha = max(s.cursor_alpha - CURSOR_STEP * 0.5, 0.0)
             s.is_fixating = False
+            self._fixation_counter = 0
 
         return s
 
@@ -233,11 +233,13 @@ class EyeTracker:
             radius = 15
             alpha_int = int(current_state.cursor_alpha * 255)
 
+            # SRCALPHA so alpha fade actually renders
             surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
             pygame.draw.circle(
                 surf, (*COLORS[4][:3], alpha_int), (radius, radius), radius
             )
 
+            # fixation ring: green = fixating, amber = scanning
             if current_state.is_fixating:
                 ring_col = (60, 220, 120, alpha_int // 2)
             else:
@@ -246,6 +248,7 @@ class EyeTracker:
             pygame.draw.circle(surf, ring_col, (radius, radius), radius, 3)
             screen.blit(surf, (cx - radius, cy - radius))
 
+        # camera thumbnail
         try:
             thumb = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT))
             thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB).swapaxes(0, 1)
@@ -257,6 +260,7 @@ class EyeTracker:
         except Exception:
             pass
 
+        # HUD: blink state + BPM
         bpm = len(self._blink_log)
         if current_state.blink_detected:
             blink_txt = f"Blinking   BPM: {bpm}"
@@ -264,9 +268,9 @@ class EyeTracker:
         else:
             blink_txt = f"Eyes open  BPM: {bpm}"
             blink_clr = (60, 210, 100)
-
         screen.blit(font.render(blink_txt, True, blink_clr), (50, 100))
 
+        # fixation label — clearly visible
         try:
             small = pygame.font.SysFont("Arial", 18)
             if current_state.is_fixating:
